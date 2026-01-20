@@ -172,7 +172,7 @@ def chunk_text(text: str, max_chars: int = 50000) -> List[str]:
     
     return chunks
 
-async def call_groq(prompt: str, context: str = "", model: str = "llama-3.1-70b-versatile") -> str:
+async def call_groq(prompt: str, context: str = "", model: str = "llama-3.3-70b-versatile") -> str:
     """Call Groq API with rate limiting and chunking"""
     async with api_semaphore:
         # Limit total input size
