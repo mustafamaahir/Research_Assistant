@@ -122,7 +122,7 @@ def extract_docx_text(file_bytes: bytes) -> str:
     doc = docx.Document(io.BytesIO(file_bytes))
     return "\n".join([para.text for para in doc.paragraphs])
 
-async def call_groq(prompt: str, context: str = "", model: str = "llama-3.1-70b-versatile") -> str:
+async def call_groq(prompt: str, context: str = "", model: str = "llama-3.3-70b-versatile") -> str:
     """Call Groq API with rate limiting"""
     async with api_semaphore:
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
