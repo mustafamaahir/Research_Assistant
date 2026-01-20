@@ -262,66 +262,78 @@ class ReportRequest(BaseModel):
 
 @app.post("/research/upload")
 async def upload_research_pdfs(
-    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
+    session_id: str = Form(...)
 ):
-    session_id = str(uuid.uuid4())
     session = get_session(session_id)
+
+    if not hasattr(session, "research_texts"):
+        session.research_texts = []
+
     uploaded_files = []
-    
+
     for file in files:
-        if not file.filename.endswith('.pdf'):
-            raise HTTPException(400, "Only PDF files are allowed")
-        
+        if not file.filename.lower().endswith(".pdf"):
+            raise HTTPException(status_code=400, detail="Only PDF files allowed")
+
         content = await file.read()
-        
-        # Process immediately (removed background processing to avoid celery issues)
         text = extract_pdf_text(content)
-        
-        if text:
-            session.research_pdfs.append({
-                "name": file.filename,
-                "size": len(content),
-                "processed": True
-            })
-            session.research_texts.append(f"File: {file.filename}\n{text[:30000]}")  # Limit per file
-            uploaded_files.append({"name": file.filename, "size": len(content)})
-        else:
-            raise HTTPException(400, f"Could not extract text from {file.filename}")
-    
+
+        if not text.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"No text extracted from {file.filename}"
+            )
+
+        session.research_texts.append(text)
+        uploaded_files.append({"name": file.filename})
+
     save_session(session)
-    return {"files": uploaded_files, "session_id": session_id}
+
+    return {
+        "files": uploaded_files,
+        "session_id": session_id
+    }
 
 @app.post("/research/execute")
 async def execute_research_task(request: ResearchTaskRequest):
     session = get_session(request.session_id)
-    
-    if not session.research_texts:
-        raise HTTPException(400, "No research PDFs uploaded or processed")
-    
-    # Combine all PDF texts - with strict limits
+
+    if not hasattr(session, "research_texts") or not session.research_texts:
+        raise HTTPException(
+            status_code=400,
+            detail="No research PDFs uploaded or processed"
+        )
+
     all_texts = "\n\n---\n\n".join(session.research_texts)
-    
-    # Aggressive truncation to avoid 413 errors
-    max_context = 30000  # ~7.5k tokens
+
+    max_context = 30000
     if len(all_texts) > max_context:
         all_texts = all_texts[:max_context] + "\n\n[Additional content truncated...]"
-    
-    context_prompt = f"""You are a professional research assistant. You have access to the following research papers:
+
+    context_prompt = f"""
+You are a professional research assistant. You have access to the following research papers:
 
 {all_texts}
 
-Based on these papers, complete the following task. Use APA citation format when referencing.
-
 Task: {request.prompt}
 
-Keep your response focused and concise (max 800 words)."""
-    
-    response = await call_groq(context_prompt)
-    session.research_responses.append({"prompt": request.prompt, "response": response})
+Use APA citation format. Max 800 words.
+"""
+
+    try:
+        response = await call_groq(context_prompt)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+    session.research_responses.append({
+        "prompt": request.prompt,
+        "response": response
+    })
     save_session(session)
-    
+
     return {"response": response}
+
 
 @app.post("/analysis/upload")
 async def upload_analysis_file(
