@@ -29,7 +29,7 @@ const ResearchAssistant = () => {
   // Update API_BASE with your deployed Render URL
   // For local testing: 'http://localhost:8000'
   // For production: 'https://your-app.onrender.com'
-  const API_BASE = 'https://research-assistant-kn55.onrender.com';
+  const API_BASE = 'http://localhost:8000';
 
   useEffect(() => {
     if (!sessionId) {
@@ -56,15 +56,21 @@ const ResearchAssistant = () => {
         body: formData
       });
       
-      if (!response.ok) throw new Error('Upload failed');
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Upload failed');
+      }
       
       const data = await response.json();
+      
+      // CRITICAL: Update session ID from server response
       setSessionId(data.session_id);
+      
       setResearchFiles(prev => [...prev, ...data.files]);
       setUploadProgress('');
     } catch (error) {
       console.error('Upload error:', error);
-      setError('Failed to upload PDFs. Please try again.');
+      setError(`Failed to upload PDFs: ${error.message}`);
     }
     setLoading(false);
   };
@@ -105,7 +111,10 @@ const ResearchAssistant = () => {
   };
 
   const handleResearchTask = async () => {
-    if (!researchPrompt.trim() || !sessionId) return;
+    if (!researchPrompt.trim() || !sessionId) {
+      setError('Please upload PDFs first and ensure session is active');
+      return;
+    }
 
     setLoading(true);
     setError('');
@@ -120,13 +129,16 @@ const ResearchAssistant = () => {
         })
       });
       
-      if (!response.ok) throw new Error('Task execution failed');
+      if (!response.ok) {
+        const errorData = await response.json();
+        throw new Error(errorData.detail || 'Task execution failed');
+      }
       
       const data = await response.json();
       setResearchResponse(data.response);
     } catch (error) {
       console.error('Task error:', error);
-      setError('Failed to execute task. Make sure PDFs are uploaded and processed.');
+      setError(`Failed to execute task: ${error.message}. Make sure PDFs are uploaded and processed.`);
     }
     setLoading(false);
   };
