@@ -45,7 +45,6 @@ const ResearchAssistant = () => {
     const files = Array.from(e.target.files);
     const formData = new FormData();
     files.forEach(file => formData.append('files', file));
-    formData.append('session_id', sessionId);
 
     setLoading(true);
     setUploadProgress('Uploading PDFs...');
