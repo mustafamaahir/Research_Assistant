@@ -20,7 +20,7 @@ import asyncio
 
 app = FastAPI()
 
-# CORS
+# CORS - Allow all origins for now
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -30,10 +30,17 @@ app.add_middleware(
 )
 
 # Redis connection
-redis_client = redis.from_url(
-    os.getenv("REDIS_URL", "redis://localhost:6379"),
-    decode_responses=True
-)
+try:
+    redis_client = redis.from_url(
+        os.getenv("REDIS_URL", "redis://localhost:6379"),
+        decode_responses=True,
+        socket_connect_timeout=5
+    )
+    redis_client.ping()
+    print("✓ Redis connected successfully")
+except Exception as e:
+    print(f"⚠ Redis connection failed: {e}")
+    redis_client = None
 
 # Celery configuration
 celery_app = Celery(
@@ -47,7 +54,10 @@ GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_API_URL = "https://api.groq.com/openai/v1/chat/completions"
 
 # Semaphore for rate limiting
-api_semaphore = asyncio.Semaphore(10)  # Max 10 concurrent API calls
+api_semaphore = asyncio.Semaphore(10)
+
+# In-memory fallback if Redis fails
+memory_sessions = {}
 
 class SessionData:
     def __init__(self, session_id: str):
@@ -92,40 +102,92 @@ class SessionData:
         return session
 
 def get_session(session_id: str) -> SessionData:
-    try:
-        data = redis_client.get(f"session:{session_id}")
-        if data:
-            return SessionData.from_dict(json.loads(data))
-    except Exception as e:
-        print(f"Redis get error: {e}")
+    # Try Redis first
+    if redis_client:
+        try:
+            data = redis_client.get(f"session:{session_id}")
+            if data:
+                return SessionData.from_dict(json.loads(data))
+        except Exception as e:
+            print(f"Redis get error: {e}")
     
-    return SessionData(session_id)
+    # Fallback to memory
+    if session_id in memory_sessions:
+        return memory_sessions[session_id]
+    
+    # Create new session
+    session = SessionData(session_id)
+    memory_sessions[session_id] = session
+    return session
 
 def save_session(session: SessionData):
-    try:
-        redis_client.setex(
-            f"session:{session.session_id}",
-            7200,  # 2 hours TTL
-            json.dumps(session.to_dict())
-        )
-    except Exception as e:
-        print(f"Redis save error: {e}")
+    # Save to memory first
+    memory_sessions[session.session_id] = session
+    
+    # Try Redis
+    if redis_client:
+        try:
+            redis_client.setex(
+                f"session:{session.session_id}",
+                7200,  # 2 hours TTL
+                json.dumps(session.to_dict())
+            )
+        except Exception as e:
+            print(f"Redis save error: {e}")
 
 def extract_pdf_text(file_bytes: bytes) -> str:
-    pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
-    text = ""
-    for page in pdf_reader.pages:
-        text += page.extract_text()
-    return text
+    try:
+        pdf_reader = PyPDF2.PdfReader(io.BytesIO(file_bytes))
+        text = ""
+        for page in pdf_reader.pages:
+            text += page.extract_text() + "\n"
+        return text
+    except Exception as e:
+        print(f"PDF extraction error: {e}")
+        return ""
 
 def extract_docx_text(file_bytes: bytes) -> str:
-    doc = docx.Document(io.BytesIO(file_bytes))
-    return "\n".join([para.text for para in doc.paragraphs])
+    try:
+        doc = docx.Document(io.BytesIO(file_bytes))
+        return "\n".join([para.text for para in doc.paragraphs])
+    except Exception as e:
+        print(f"DOCX extraction error: {e}")
+        return ""
 
-async def call_groq(prompt: str, context: str = "", model: str = "llama-3.3-70b-versatile") -> str:
-    """Call Groq API with rate limiting"""
+def chunk_text(text: str, max_chars: int = 50000) -> List[str]:
+    """Split text into chunks to avoid payload size limits"""
+    chunks = []
+    current_chunk = ""
+    
+    for paragraph in text.split('\n'):
+        if len(current_chunk) + len(paragraph) > max_chars:
+            if current_chunk:
+                chunks.append(current_chunk)
+            current_chunk = paragraph
+        else:
+            current_chunk += "\n" + paragraph
+    
+    if current_chunk:
+        chunks.append(current_chunk)
+    
+    return chunks
+
+async def call_groq(prompt: str, context: str = "", model: str = "llama-3.1-70b-versatile") -> str:
+    """Call Groq API with rate limiting and chunking"""
     async with api_semaphore:
+        # Limit total input size
+        max_total_chars = 60000  # ~15k tokens
+        
+        if context:
+            # Truncate context if too long
+            if len(context) > 40000:
+                context = context[:40000] + "\n\n[Context truncated due to length...]"
+        
         full_prompt = f"{context}\n\n{prompt}" if context else prompt
+        
+        # Final check
+        if len(full_prompt) > max_total_chars:
+            full_prompt = full_prompt[:max_total_chars] + "\n\n[Truncated...]"
         
         headers = {
             "Authorization": f"Bearer {GROQ_API_KEY}",
@@ -137,7 +199,7 @@ async def call_groq(prompt: str, context: str = "", model: str = "llama-3.3-70b-
             "messages": [
                 {
                     "role": "system",
-                    "content": "You are a professional research assistant with expertise in academic writing, data analysis, and research methodology."
+                    "content": "You are a professional research assistant with expertise in academic writing, data analysis, and research methodology. Provide concise, accurate responses."
                 },
                 {
                     "role": "user",
@@ -145,14 +207,26 @@ async def call_groq(prompt: str, context: str = "", model: str = "llama-3.3-70b-
                 }
             ],
             "temperature": 0.7,
-            "max_tokens": 8000
+            "max_tokens": 4000  # Reduced from 8000
         }
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(GROQ_API_URL, headers=headers, json=payload)
-            response.raise_for_status()
-            data = response.json()
-            return data["choices"][0]["message"]["content"]
+        try:
+            async with httpx.AsyncClient(timeout=60.0) as client:
+                response = await client.post(GROQ_API_URL, headers=headers, json=payload)
+                response.raise_for_status()
+                data = response.json()
+                return data["choices"][0]["message"]["content"]
+        except httpx.HTTPStatusError as e:
+            if e.response.status_code == 413:
+                # Payload too large - try with even smaller context
+                if context:
+                    truncated_context = context[:20000]
+                    return await call_groq(prompt, truncated_context, model)
+                else:
+                    raise HTTPException(500, "Prompt too large even after truncation")
+            raise HTTPException(500, f"Groq API error: {str(e)}")
+        except Exception as e:
+            raise HTTPException(500, f"API call failed: {str(e)}")
 
 # Celery task for background PDF processing
 @celery_app.task
@@ -201,27 +275,19 @@ async def upload_research_pdfs(
         
         content = await file.read()
         
-        # Process immediately for small files, background for large files
-        if len(content) < 1_000_000:  # < 1MB
-            text = extract_pdf_text(content)
+        # Process immediately (removed background processing to avoid celery issues)
+        text = extract_pdf_text(content)
+        
+        if text:
             session.research_pdfs.append({
                 "name": file.filename,
                 "size": len(content),
                 "processed": True
             })
-            session.research_texts.append(f"File: {file.filename}\n{text}")
+            session.research_texts.append(f"File: {file.filename}\n{text[:30000]}")  # Limit per file
+            uploaded_files.append({"name": file.filename, "size": len(content)})
         else:
-            # Process in background for large files
-            import base64
-            content_base64 = base64.b64encode(content).decode()
-            background_tasks.add_task(process_pdf_background, session_id, file.filename, content_base64)
-            session.research_pdfs.append({
-                "name": file.filename,
-                "size": len(content),
-                "processed": False
-            })
-        
-        uploaded_files.append({"name": file.filename, "size": len(content)})
+            raise HTTPException(400, f"Could not extract text from {file.filename}")
     
     save_session(session)
     return {"files": uploaded_files, "session_id": session_id}
@@ -231,23 +297,25 @@ async def execute_research_task(request: ResearchTaskRequest):
     session = get_session(request.session_id)
     
     if not session.research_texts:
-        raise HTTPException(400, "No research PDFs uploaded or still processing")
+        raise HTTPException(400, "No research PDFs uploaded or processed")
     
-    # Combine all PDF texts for context (truncate if too long)
-    context = "\n\n---\n\n".join(session.research_texts)
+    # Combine all PDF texts - with strict limits
+    all_texts = "\n\n---\n\n".join(session.research_texts)
     
-    # Truncate context if too long (keep within Groq's context window)
-    max_context_chars = 100000  # ~25k tokens
-    if len(context) > max_context_chars:
-        context = context[:max_context_chars] + "\n\n[Context truncated...]"
+    # Aggressive truncation to avoid 413 errors
+    max_context = 30000  # ~7.5k tokens
+    if len(all_texts) > max_context:
+        all_texts = all_texts[:max_context] + "\n\n[Additional content truncated...]"
     
     context_prompt = f"""You are a professional research assistant. You have access to the following research papers:
 
-{context}
+{all_texts}
 
-Based on these papers, please complete the following task. Use APA citation format when referencing the papers.
+Based on these papers, complete the following task. Use APA citation format when referencing.
 
-Task: {request.prompt}"""
+Task: {request.prompt}
+
+Keep your response focused and concise (max 800 words)."""
     
     response = await call_groq(context_prompt)
     session.research_responses.append({"prompt": request.prompt, "response": response})
@@ -291,42 +359,29 @@ async def start_analysis(session_id: str = Form(...)):
     if session.analysis_data is None or session.analysis_objectives is None:
         raise HTTPException(400, "Data and objectives files are required")
     
-    # Prepare context
-    data_summary = f"""Dataset Overview:
-- Columns: {', '.join(session.analysis_data.columns)}
+    # Prepare limited context
+    data_info = f"""Dataset Overview:
+- Columns: {', '.join(session.analysis_data.columns[:20])}  
 - Rows: {len(session.analysis_data)}
-- Data types: {session.analysis_data.dtypes.to_dict()}
-- Sample data (first 10 rows):
-{session.analysis_data.head(10).to_string()}
-
-Statistical summary:
-{session.analysis_data.describe().to_string()}"""
+- Sample (first 5 rows):
+{session.analysis_data.head(5).to_string()}"""
     
-    objectives_context = f"Research Objectives and Methods:\n{session.analysis_objectives}"
+    objectives_text = session.analysis_objectives[:5000]  # Limit objectives length
     
-    guide_context = ""
-    if session.analysis_guide:
-        guide_context = f"\n\nFormat Guide (follow this structure):\n{session.analysis_guide}"
-    
-    # Ask Groq to create analysis plan
-    planning_prompt = f"""{objectives_context}
+    planning_prompt = f"""Based on these objectives and dataset, create 5 clear analysis steps.
 
-{data_summary}
-{guide_context}
+Objectives: {objectives_text}
 
-Based on the objectives and methods described above, and the dataset provided, create a detailed step-by-step analysis plan. For each step:
-1. Clearly state what analysis will be performed
-2. Explain why this step is necessary
-3. Describe what output will be generated
+{data_info}
 
-Provide EXACTLY 5 clear, actionable steps. Format each step as:
-Step X: [Title]
-Description: [What will be done]
+Provide EXACTLY 5 steps. Format:
+Step 1: [Title]
+Description: [What to do]
 Expected Output: [What will be produced]"""
     
     plan_response = await call_groq(planning_prompt)
     
-    # Parse into steps
+    # Parse steps
     steps = []
     lines = plan_response.split('\n')
     current_step = None
@@ -350,19 +405,18 @@ Expected Output: [What will be produced]"""
     if current_step:
         steps.append(current_step)
     
-    # Ensure we have at least one step
     if not steps:
         steps = [{
             "id": str(uuid.uuid4()),
             "title": "Data Analysis",
-            "description": "Perform comprehensive data analysis based on objectives",
+            "description": "Perform comprehensive analysis",
             "completed": False
         }]
     
     session.analysis_steps = steps
     save_session(session)
     
-    return {"steps": steps[:1] if steps else []}  # Return first step
+    return {"steps": steps[:1]}
 
 @app.post("/analysis/approve")
 async def approve_analysis_step(request: ApprovalRequest):
@@ -371,37 +425,26 @@ async def approve_analysis_step(request: ApprovalRequest):
     if not request.approved:
         return {"status": "rejected"}
     
-    # Find the current step
     step = next((s for s in session.analysis_steps if s["id"] == request.step_id), None)
     if not step:
         raise HTTPException(404, "Step not found")
     
-    # Execute the step
-    data_context = f"""Dataset Information:
-Columns: {', '.join(session.analysis_data.columns)}
-Shape: {session.analysis_data.shape}
-Sample data:
-{session.analysis_data.head(10).to_string()}
-
-Previous analysis results:
-{chr(10).join([r.get('summary', '') for r in session.analysis_results[-3:]])}
-"""
+    # Limited context for execution
+    data_summary = f"""Dataset: {len(session.analysis_data)} rows, {len(session.analysis_data.columns)} columns
+Sample:
+{session.analysis_data.head(5).to_string()}"""
     
-    execution_prompt = f"""{data_context}
+    execution_prompt = f"""{data_summary}
 
-Execute this analysis step:
-{step['description']}
+Execute: {step['description']}
 
-Provide:
-1. Detailed methodology used
-2. Key findings and results
-3. Statistical values (means, correlations, p-values, etc. as applicable)
-4. Tables in text format if applicable
-5. Clear interpretation of results
-
-Keep the response comprehensive but concise (max 500 words)."""
+Provide concise results (max 400 words):
+1. Methodology
+2. Key findings
+3. Statistical values
+4. Interpretation"""
     
-    result = await call_groq(execution_prompt, model="llama-3.1-70b-versatile")
+    result = await call_groq(execution_prompt)
     
     session.analysis_results.append({
         "step_id": request.step_id,
@@ -415,37 +458,24 @@ Keep the response comprehensive but concise (max 500 words)."""
 async def generate_report(request: ReportRequest):
     session = get_session(request.session_id)
     
-    # Create Word document
     doc = docx.Document()
     
-    # Title
     title = doc.add_heading(f"{request.type.capitalize()} Report", 0)
     title.alignment = WD_ALIGN_PARAGRAPH.CENTER
     
-    # Date
     doc.add_paragraph(f"Generated: {datetime.now().strftime('%B %d, %Y')}")
     doc.add_paragraph()
     
     if request.type == "research":
-        # Compile research responses
         for section in request.sections:
             doc.add_heading(section, 1)
             
-            # Find relevant responses
             relevant = [r for r in session.research_responses if section.lower() in r['prompt'].lower()]
             if relevant:
                 for resp in relevant:
                     doc.add_paragraph(resp['response'])
             else:
-                # Generate content for this section using Groq
-                context = "\n\n".join(session.research_texts[:3])  # Use first 3 PDFs
-                prompt = f"Based on the research papers, write a comprehensive {section} section for an academic paper."
-                
-                try:
-                    content = await call_groq(prompt, context)
-                    doc.add_paragraph(content)
-                except:
-                    doc.add_paragraph(f"[Content for {section} section - please add manually]")
+                doc.add_paragraph(f"[Content for {section} section]")
             
             doc.add_paragraph()
     
@@ -454,22 +484,15 @@ async def generate_report(request: ReportRequest):
             doc.add_heading(section, 1)
             
             if section == "Objectives":
-                doc.add_paragraph(session.analysis_objectives or "[Objectives not provided]")
-            elif section == "Data Description":
-                if session.analysis_data is not None:
-                    desc = f"Dataset contains {len(session.analysis_data)} observations across {len(session.analysis_data.columns)} variables.\n\n"
-                    desc += f"Variables: {', '.join(session.analysis_data.columns)}"
-                    doc.add_paragraph(desc)
-            elif section in ["Methods", "Statistical Analysis", "Results", "Interpretation", "Tables & Figures"]:
-                # Include analysis results
+                doc.add_paragraph(session.analysis_objectives or "[Not provided]")
+            elif section in ["Methods", "Results", "Interpretation"]:
                 for result in session.analysis_results:
                     doc.add_paragraph(result.get('summary', ''))
             else:
-                doc.add_paragraph(f"[Content for {section} section]")
+                doc.add_paragraph(f"[Content for {section}]")
             
             doc.add_paragraph()
     
-    # Save to bytes
     buffer = io.BytesIO()
     doc.save(buffer)
     buffer.seek(0)
@@ -477,25 +500,31 @@ async def generate_report(request: ReportRequest):
     return StreamingResponse(
         buffer,
         media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-        headers={"Content-Disposition": f"attachment; filename={request.type}_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.docx"}
+        headers={"Content-Disposition": f"attachment; filename={request.type}_report_{datetime.now().strftime('%Y%m%d')}.docx"}
     )
 
 @app.post("/session/clear")
 async def clear_session(session_id: str = Form(...)):
-    try:
-        redis_client.delete(f"session:{session_id}")
-    except Exception as e:
-        print(f"Redis delete error: {e}")
+    if redis_client:
+        try:
+            redis_client.delete(f"session:{session_id}")
+        except Exception as e:
+            print(f"Redis delete error: {e}")
+    
+    if session_id in memory_sessions:
+        del memory_sessions[session_id]
     
     return {"status": "cleared"}
 
 @app.get("/health")
 async def health_check():
-    try:
-        redis_client.ping()
-        redis_status = "connected"
-    except:
-        redis_status = "disconnected"
+    redis_status = "disconnected"
+    if redis_client:
+        try:
+            redis_client.ping()
+            redis_status = "connected"
+        except:
+            redis_status = "error"
     
     return {
         "status": "healthy",
@@ -505,4 +534,4 @@ async def health_check():
 
 @app.get("/")
 async def root():
-    return {"message": "AI Research Assistant API with Groq", "version": "2.0"}
+    return {"message": "AI Research Assistant API with Groq", "version": "2.1"}
