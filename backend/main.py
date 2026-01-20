@@ -266,24 +266,17 @@ async def upload_research_pdfs(
     session_id: str = Form(...)
 ):
     session = get_session(session_id)
-
-    if not hasattr(session, "research_texts"):
-        session.research_texts = []
-
     uploaded_files = []
 
     for file in files:
-        if not file.filename.lower().endswith(".pdf"):
-            raise HTTPException(status_code=400, detail="Only PDF files allowed")
+        if not file.filename.endswith(".pdf"):
+            raise HTTPException(400, "Only PDF files allowed")
 
         content = await file.read()
         text = extract_pdf_text(content)
 
-        if not text.strip():
-            raise HTTPException(
-                status_code=400,
-                detail=f"No text extracted from {file.filename}"
-            )
+        if not text:
+            raise HTTPException(400, f"No text extracted from {file.filename}")
 
         session.research_texts.append(text)
         uploaded_files.append({"name": file.filename})
@@ -298,42 +291,33 @@ async def upload_research_pdfs(
 @app.post("/research/execute")
 async def execute_research_task(request: ResearchTaskRequest):
     session = get_session(request.session_id)
-
-    if not hasattr(session, "research_texts") or not session.research_texts:
-        raise HTTPException(
-            status_code=400,
-            detail="No research PDFs uploaded or processed"
-        )
-
+    
+    if not session.research_texts:
+        raise HTTPException(400, "No research PDFs uploaded or processed")
+    
+    # Combine all PDF texts - with strict limits
     all_texts = "\n\n---\n\n".join(session.research_texts)
-
-    max_context = 30000
+    
+    # Aggressive truncation to avoid 413 errors
+    max_context = 30000  # ~7.5k tokens
     if len(all_texts) > max_context:
         all_texts = all_texts[:max_context] + "\n\n[Additional content truncated...]"
-
-    context_prompt = f"""
-You are a professional research assistant. You have access to the following research papers:
+    
+    context_prompt = f"""You are a professional research assistant. You have access to the following research papers:
 
 {all_texts}
 
+Based on these papers, complete the following task. Use APA citation format when referencing.
+
 Task: {request.prompt}
 
-Use APA citation format. Max 800 words.
-"""
-
-    try:
-        response = await call_groq(context_prompt)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-    session.research_responses.append({
-        "prompt": request.prompt,
-        "response": response
-    })
+Keep your response focused and concise (max 800 words)."""
+    
+    response = await call_groq(context_prompt)
+    session.research_responses.append({"prompt": request.prompt, "response": response})
     save_session(session)
-
+    
     return {"response": response}
-
 
 @app.post("/analysis/upload")
 async def upload_analysis_file(
