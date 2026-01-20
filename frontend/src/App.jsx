@@ -29,7 +29,7 @@ const ResearchAssistant = () => {
   // Update API_BASE with your deployed Render URL
   // For local testing: 'http://localhost:8000'
   // For production: 'https://your-app.onrender.com'
-  const API_BASE = 'http://localhost:8000';
+  const API_BASE = 'https://research-assistant-kn55.onrender.com/';
 
   useEffect(() => {
     if (!sessionId) {
