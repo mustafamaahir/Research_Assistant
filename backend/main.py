@@ -535,3 +535,8 @@ async def health_check():
 @app.get("/")
 async def root():
     return {"message": "AI Research Assistant API with Groq", "version": "2.1"}
+
+@app.api_route("/status", methods=["GET", "HEAD"])
+def status():
+    """Health check endpoint."""
+    return {"status": "ok", "message": "Research Project API is running."}
