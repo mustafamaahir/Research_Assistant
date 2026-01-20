@@ -262,31 +262,35 @@ class ReportRequest(BaseModel):
 
 @app.post("/research/upload")
 async def upload_research_pdfs(
+    background_tasks: BackgroundTasks,
     files: List[UploadFile] = File(...),
-    session_id: str = Form(...)
 ):
+    session_id = str(uuid.uuid4())
     session = get_session(session_id)
     uploaded_files = []
-
+    
     for file in files:
-        if not file.filename.endswith(".pdf"):
-            raise HTTPException(400, "Only PDF files allowed")
-
+        if not file.filename.endswith('.pdf'):
+            raise HTTPException(400, "Only PDF files are allowed")
+        
         content = await file.read()
+        
+        # Process immediately (removed background processing to avoid celery issues)
         text = extract_pdf_text(content)
-
-        if not text:
-            raise HTTPException(400, f"No text extracted from {file.filename}")
-
-        session.research_texts.append(text)
-        uploaded_files.append({"name": file.filename})
-
+        
+        if text:
+            session.research_pdfs.append({
+                "name": file.filename,
+                "size": len(content),
+                "processed": True
+            })
+            session.research_texts.append(f"File: {file.filename}\n{text[:30000]}")  # Limit per file
+            uploaded_files.append({"name": file.filename, "size": len(content)})
+        else:
+            raise HTTPException(400, f"Could not extract text from {file.filename}")
+    
     save_session(session)
-
-    return {
-        "files": uploaded_files,
-        "session_id": session_id
-    }
+    return {"files": uploaded_files, "session_id": session_id}
 
 @app.post("/research/execute")
 async def execute_research_task(request: ResearchTaskRequest):
